@@ -122,6 +122,19 @@ func merge(cs []chan map[string]string) <-chan map[string]string {
 	return out
 }
 
+func connect(host string) (redis.Conn, error) {
+	var (
+		conn redis.Conn
+		err  error
+	)
+	if strings.HasPrefix(host, "redis://") {
+		conn, err = redis.DialURL(host)
+	} else {
+		conn, err = redis.Dial("tcp", host)
+	}
+	return conn, err
+}
+
 func main() {
 	from := flag.String("from", "", "example: redis://127.0.0.1:6379/0")
 	to := flag.String("to", "", "example: redis://127.0.0.1:6379/1")
@@ -136,15 +149,7 @@ func main() {
 	conns := make([]redis.Conn, len(sources))
 	chans := make([]chan map[string]string, len(sources))
 	for i := range sources {
-		var (
-			conn redis.Conn
-			err  error
-		)
-		if strings.HasPrefix(sources[i], "redis://") {
-			conn, err = redis.DialURL(sources[i])
-		} else {
-			conn, err = redis.Dial("tcp", sources[i])
-		}
+		conn, err := connect(sources[i])
 		handle(err)
 		conns[i] = conn
 		chans[i] = make(chan map[string]string)
@@ -152,7 +157,7 @@ func main() {
 	fmt.Printf("sources: %v\n", sources)
 	fmt.Printf("destination: %s\n", *to)
 
-	destination, err := redis.DialURL(*to)
+	destination, err := connect(*to)
 	handle(err)
 	defer destination.Close()
 
