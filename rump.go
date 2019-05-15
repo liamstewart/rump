@@ -136,7 +136,15 @@ func main() {
 	conns := make([]redis.Conn, len(sources))
 	chans := make([]chan map[string]string, len(sources))
 	for i := range sources {
-		conn, err := redis.DialURL(sources[i])
+		var (
+			conn redis.Conn
+			err  error
+		)
+		if strings.HasPrefix(sources[i], "redis://") {
+			conn, err = redis.DialURL(sources[i])
+		} else {
+			conn, err = redis.Dial("tcp", sources[i])
+		}
 		handle(err)
 		conns[i] = conn
 		chans[i] = make(chan map[string]string)
