@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,14 +28,22 @@ func handle(err error) {
 //	Queue chan<- map[string]string
 //}
 
+type Entry struct {
+	Data string
+	TTL  string
+}
+
 // Scan and queue source keys.
-func get(source string, conn redis.Conn, queue chan<- map[string]string, count int64, match string, limit float64) {
+func get(source string, conn redis.Conn, queue chan<- map[string]Entry, count int64, match string, limit float64, syncTTL, verbose bool) {
 	var (
 		cursor int64
 		keys   []string
 	)
 
+	fmt.Printf("running get for %s\n", source)
+
 	limiter := rate.NewLimiter(rate.Limit(limit), 5)
+	totalScanned := 0
 
 	args := []interface{}{cursor, "COUNT", count}
 	if len(match) > 0 {
@@ -52,18 +61,36 @@ func get(source string, conn redis.Conn, queue chan<- map[string]string, count i
 		values, err = redis.Scan(values, &cursor, &keys)
 		handle(err)
 
+		totalScanned += len(keys)
+		if len(keys) > 0 {
+			fmt.Printf("scanned %d key(s) from %s [%d total]\n", len(keys), source, totalScanned)
+		}
+
 		// Get pipelined dumps.
-		fmt.Printf("scanned %d key(s) from %s\n", len(keys), source)
 		for _, key := range keys {
+			if verbose {
+				fmt.Printf("DUMPing key: %s\n", key)
+			}
 			conn.Send("DUMP", key)
 		}
 		dumps, err := redis.Strings(conn.Do(""))
 		handle(err)
 
+		// Get pipelined TTLs.
+		for _, key := range keys {
+			conn.Send("PTTL", key)
+		}
+		ttls, err := redis.Ints(conn.Do(""))
+		handle(err)
+
 		// Build batch map.
-		batch := make(map[string]string)
+		batch := make(map[string]Entry)
 		for i := range keys {
-			batch[keys[i]] = dumps[i]
+			ttl := "0"
+			if syncTTL && ttls[i] >= 0 {
+				ttl = strconv.Itoa(ttls[i])
+			}
+			batch[keys[i]] = Entry{dumps[i], ttl}
 		}
 
 		// Last iteration of scan.
@@ -84,26 +111,33 @@ func get(source string, conn redis.Conn, queue chan<- map[string]string, count i
 }
 
 // Restore a batch of keys on destination.
-func put(conn redis.Conn, queue <-chan map[string]string, limit float64) {
+func put(conn redis.Conn, queue <-chan map[string]Entry, limit float64, dryRun, replace bool) {
 	limiter := rate.NewLimiter(rate.Limit(limit), 5)
 
 	for batch := range queue {
 		err := limiter.Wait(context.TODO())
 		handle(err)
-		for key, value := range batch {
-			conn.Send("RESTORE", key, "0", value)
+
+		if !dryRun {
+			for key, entry := range batch {
+				args := []interface{}{key, entry.TTL, entry.Data}
+				if replace {
+					args = append(args, "REPLACE")
+				}
+				conn.Send("RESTORE", args...)
+			}
+			_, err = conn.Do("")
+			handle(err)
 		}
-		_, err = conn.Do("")
-		handle(err)
 
 		fmt.Printf(".")
 	}
 }
 
-func merge(cs []chan map[string]string) <-chan map[string]string {
+func merge(cs []chan map[string]Entry) <-chan map[string]Entry {
 	var wg sync.WaitGroup
-	out := make(chan map[string]string)
-	output := func(c <-chan map[string]string) {
+	out := make(chan map[string]Entry)
+	output := func(c <-chan map[string]Entry) {
 		for msg := range c {
 			out <- msg
 		}
@@ -142,17 +176,21 @@ func main() {
 	match := flag.String("match", "", "glob to use for matching keys")
 	fromLimit := flag.Float64("fromLimit", math.MaxFloat64, "source rate limit")
 	toLimit := flag.Float64("toLimit", math.MaxFloat64, "destination rate limit")
+	dryRun := flag.Bool("dryRun", false, "do a dry run")
+	verbose := flag.Bool("verbose", false, "be extra verbose")
+	syncTTL := flag.Bool("syncTTL", false, "sync TTL")
+	replace := flag.Bool("replace", false, "replace")
 
 	flag.Parse()
 
 	sources := strings.Split(*from, ",")
 	conns := make([]redis.Conn, len(sources))
-	chans := make([]chan map[string]string, len(sources))
+	chans := make([]chan map[string]Entry, len(sources))
 	for i := range sources {
 		conn, err := connect(sources[i])
 		handle(err)
 		conns[i] = conn
-		chans[i] = make(chan map[string]string)
+		chans[i] = make(chan map[string]Entry)
 	}
 	fmt.Printf("sources: %v\n", sources)
 	fmt.Printf("destination: %s\n", *to)
@@ -166,11 +204,12 @@ func main() {
 
 	// Scan and send to queue.
 	for i := range conns {
-		go get(sources[i], conns[i], chans[i], *count, *match, *fromLimit)
+		fmt.Printf("Starting get for %s\n", sources[i])
+		go get(sources[i], conns[i], chans[i], *count, *match, *fromLimit, *syncTTL, *verbose)
 	}
 
 	// Restore keys as they come into queue.
-	put(destination, queue, *toLimit)
+	put(destination, queue, *toLimit, *dryRun, *replace)
 
 	fmt.Println("Sync done.")
 
